@@ -22,6 +22,7 @@ stop_group) are available as globals from earlier startup files.
 import numpy as np
 import bluesky.plan_stubs as bps
 import bluesky.preprocessors as bpp
+from ophyd import Signal
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,25 @@ RESIDENT_T_RATIO = 1.0
 # Number of absorbance and fluorescence spectra per measurement
 NUM_ABS = 10
 NUM_FLU = 10
+
+# ---------------------------------------------------------------------------
+# Good/bad fluorescence reacquisition (legacy macro_10_good_bad / macro_17 port)
+# ---------------------------------------------------------------------------
+# When enabled, after each batch of NUM_FLU fluorescence shots the in-memory
+# qepro spectrum is classified by _classify_pl. Additional batches are taken
+# (in the same Bluesky run, into the same 'fluorescence' stream) until either
+# GOOD_TARGET good batches or MAX_BAD bad batches are accumulated. One small
+# bookkeeping event per batch is emitted into a single auxiliary stream
+# 'fluorescence_quality' for traceability.
+USE_GOOD_BAD = False
+GOOD_TARGET = 3            # success once this many good batches collected
+MAX_BAD = 3                # give up after this many bad batches (log + proceed)
+GB_KEY_HEIGHT = 2000       # c1 threshold: highest peak intensity > 400 nm
+GB_PROMINENCE = 30         # scipy.find_peaks prominence (legacy 'height')
+GB_DISTANCE = 30           # scipy.find_peaks distance
+GB_INTEGRAL_LOW = 100000   # c2 threshold (peak < 560 nm)
+GB_INTEGRAL_HIGH = 200000  # c3 threshold (peak >= 560 nm)
+GB_LED_BAND = (340.0, 400.0)  # excluded from peak search; integrated separately
 
 # Precursor names (for metadata only)
 PRECURSOR_LIST = ["CsPbOA", "TOABr", "ZnI2"]
@@ -229,7 +249,7 @@ def _acquire_uvvis(md):
             yield from bps.read(qepro)
             yield from bps.save()
 
-        # --- Fluorescence ---
+        # --- Fluorescence (with optional good/bad reacquisition) ---
         yield from bps.mv(
             qepro.correction,
             "Dark",
@@ -239,11 +259,70 @@ def _acquire_uvvis(md):
         yield from bps.mv(LED, "High", UV_shutter, "Low")
         yield from bps.sleep(2)
 
-        for _ in range(NUM_FLU):
-            yield from bps.trigger(qepro, wait=True)
-            yield from bps.create(name="fluorescence")
-            yield from bps.read(qepro)
+        # Auxiliary Signals for the per-batch bookkeeping stream.
+        # Created lazily so they only exist when the plan runs.
+        q_batch_index = Signal(name="batch_index", value=0)
+        q_verdict = Signal(name="verdict", value="bad")
+        q_peak_wl = Signal(name="peak_wavelength_nm", value=float("nan"))
+        q_n_good = Signal(name="n_good_total", value=0)
+        q_n_bad = Signal(name="n_bad_total", value=0)
+        q_sigs = [q_batch_index, q_verdict, q_peak_wl, q_n_good, q_n_bad]
+
+        good_count = 0
+        bad_count = 0
+        batch_index = 0
+        # Bound the loop so a misconfigured classifier can't run forever.
+        max_batches = (GOOD_TARGET + MAX_BAD) if USE_GOOD_BAD else 1
+
+        while batch_index < max_batches:
+            # One batch of NUM_FLU shots into the 'fluorescence' stream.
+            # All retry batches share the same stream name (identical
+            # descriptor), so no stream proliferation occurs.
+            for _ in range(NUM_FLU):
+                yield from bps.trigger(qepro, wait=True)
+                yield from bps.create(name="fluorescence")
+                yield from bps.read(qepro)
+                yield from bps.save()
+
+            if not USE_GOOD_BAD:
+                break
+
+            # Snapshot the just-acquired spectrum from the device cache and
+            # classify it (legacy behavior: classifier sees one spectrum per
+            # batch, not an average across the NUM_FLU shots).
+            x = np.asarray(qepro.x_axis.get())
+            y = np.asarray(qepro.output.get())
+            is_good, peak_wl = _classify_pl(x, y)
+            if is_good:
+                good_count += 1
+            else:
+                bad_count += 1
+
+            # Emit one bookkeeping event in 'fluorescence_quality'.
+            yield from bps.mv(
+                q_batch_index, batch_index,
+                q_verdict, "good" if is_good else "bad",
+                q_peak_wl, float(peak_wl),
+                q_n_good, good_count,
+                q_n_bad, bad_count,
+            )
+            yield from bps.create(name="fluorescence_quality")
+            for s in q_sigs:
+                yield from bps.read(s)
             yield from bps.save()
+
+            batch_index += 1
+            if good_count >= GOOD_TARGET:
+                print(
+                    f"*** Got {good_count} good fluorescence batches, proceeding ***"
+                )
+                break
+            if bad_count >= MAX_BAD:
+                print(
+                    f"*** {bad_count} bad fluorescence batches, giving up "
+                    "(proceeding anyway) ***"
+                )
+                break
 
         # --- Lights off ---
         yield from bps.mv(LED, "Low", UV_shutter, "Low")
@@ -254,6 +333,69 @@ def _acquire_uvvis(md):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _classify_pl(x, y):
+    """Classify a PL spectrum as good/bad.
+
+    Minimal in-plan port of ``scripts/utils/_data_analysis.good_bad_data`` so
+    this module has no dependency on the legacy Kafka/ZMQ pipeline. The
+    classifier rejects (returns ``(False, ...)``) when any of:
+
+    - **c1** highest peak (wavelength > 400 nm, excluding the LED band)
+      has intensity below ``GB_KEY_HEIGHT``.
+    - **c2** highest peak is < 560 nm and
+      ``(PL_integral - LED_integral) < GB_INTEGRAL_LOW``.
+    - **c3** highest peak is >= 560 nm and
+      ``(PL_integral - LED_integral) < GB_INTEGRAL_HIGH``.
+
+    Parameters
+    ----------
+    x, y : array_like
+        Wavelength (nm) and intensity arrays from the QEPro.
+
+    Returns
+    -------
+    (is_good, peak_wavelength_nm) : tuple[bool, float]
+        ``peak_wavelength_nm`` is ``NaN`` when no peak is found.
+    """
+    from scipy.signal import find_peaks
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # Restrict peak search to >400 nm and exclude the LED band.
+    led_lo, led_hi = GB_LED_BAND
+    search_mask = (x > 400.0) & ~((x >= led_lo) & (x <= led_hi))
+    xs, ys = x[search_mask], y[search_mask]
+    if xs.size == 0:
+        return False, float("nan")
+
+    peaks, _ = find_peaks(ys, prominence=GB_PROMINENCE, distance=GB_DISTANCE)
+    if peaks.size == 0:
+        return False, float("nan")
+
+    top = peaks[int(np.argmax(ys[peaks]))]
+    top_wl = float(xs[top])
+    top_int = float(ys[top])
+
+    # c1
+    if top_int < GB_KEY_HEIGHT:
+        return False, top_wl
+
+    # Integrals over the full spectrum and the LED band.
+    led_mask = (x >= led_lo) & (x <= led_hi)
+    pl_int = float(np.trapz(y, x))
+    led_int = float(np.trapz(y[led_mask], x[led_mask])) if led_mask.any() else 0.0
+    delta = pl_int - led_int
+
+    # c2 / c3
+    if top_wl < 560.0 and delta < GB_INTEGRAL_LOW:
+        return False, top_wl
+    if top_wl >= 560.0 and delta < GB_INTEGRAL_HIGH:
+        return False, top_wl
+
+    return True, top_wl
 
 
 def _compute_equilibrium_wait(rate_list, ratio=1.0):
