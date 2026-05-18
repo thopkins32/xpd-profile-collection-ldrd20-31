@@ -6,22 +6,41 @@ This plan follows the Blop AcquisitionPlan protocol signature::
     def __call__(suggestions, actuators, sensors, md=None) -> uid
 
 It performs the full synthesis + measurement sequence for one optimization step:
-1. Set pump infusion rates (from suggestion DOF values)
-2. Start pumps
-3. Wait for flow equilibrium (residence time, computed from rates directly)
-4. Optionally start toluene dilution pump and wait
-5. Collect absorbance spectra
-6. Collect fluorescence spectra
-7. Return the run UID
+
+1. Set pump infusion rates (from suggestion DOF values), start pumps, wait for
+   flow equilibrium. Optionally start toluene dilution.
+2. Collect absorbance spectra.
+3. Collect fluorescence spectra. When ``USE_GOOD_BAD`` is enabled, additional
+   PL batches are taken (in the same Bluesky run) until either ``GOOD_TARGET``
+   good batches or ``MAX_BAD`` bad batches have been classified.
+4. Stop all pumps that were started (guaranteed even on exception).
+5. Return the run UID.
+
+Design (rewritten from first principles):
+
+* :func:`steady_state_flow` is a wrapper plan that owns pump setup and
+  teardown using ``bpp.finalize_wrapper``. Pumps stopped on success and
+  on exception.
+* :func:`measure_absorbance` / :func:`measure_pl` are pure measurement
+  sub-plans: configure optics, then ``trigger_and_read`` N times into a
+  named stream.
+* :class:`PLQualityMonitor` is a ``CallbackBase`` subscribed locally via
+  ``bpp.subs_decorator``. It runs synchronously in the RunEngine thread
+  between event docs, so the plan can read ``monitor.good_count`` /
+  ``monitor.bad_count`` immediately after each batch without any
+  synchronization.
+* The decision policy (continue / stop) is inline in
+  :func:`_pl_with_quality_gate`.
 
 This file is loaded into the queueserver environment via startup. All devices
-(qepro, LED, UV_shutter, pump objects) and helper plans (start_group_infuse,
-stop_group) are available as globals from earlier startup files.
+(``qepro``, ``LED``, ``UV_shutter``, pump objects) and helper plans
+(``start_group_infuse``) are available as globals from earlier startup files.
 """
 
 import numpy as np
 import bluesky.plan_stubs as bps
 import bluesky.preprocessors as bpp
+from bluesky.callbacks import CallbackBase
 from ophyd import Signal
 
 
@@ -44,7 +63,7 @@ SET_TARGET_LIST = [True, True, True]
 # Rate unit
 RATE_UNIT = "ul/min"
 
-# Mixer tubing: list of (length_cm,) for each mixer segment
+# Mixer tubing: list of length_cm for each mixer segment.
 # Used to compute residence time from rates directly.
 MIXER_LENGTHS_CM = [30.0]
 
@@ -57,25 +76,6 @@ RESIDENT_T_RATIO = 1.0
 # Number of absorbance and fluorescence spectra per measurement
 NUM_ABS = 10
 NUM_FLU = 10
-
-# ---------------------------------------------------------------------------
-# Good/bad fluorescence reacquisition (legacy macro_10_good_bad / macro_17 port)
-# ---------------------------------------------------------------------------
-# When enabled, after each batch of NUM_FLU fluorescence shots the in-memory
-# qepro spectrum is classified by _classify_pl. Additional batches are taken
-# (in the same Bluesky run, into the same 'fluorescence' stream) until either
-# GOOD_TARGET good batches or MAX_BAD bad batches are accumulated. One small
-# bookkeeping event per batch is emitted into a single auxiliary stream
-# 'fluorescence_quality' for traceability.
-USE_GOOD_BAD = False
-GOOD_TARGET = 3            # success once this many good batches collected
-MAX_BAD = 3                # give up after this many bad batches (log + proceed)
-GB_KEY_HEIGHT = 2000       # c1 threshold: highest peak intensity > 400 nm
-GB_PROMINENCE = 30         # scipy.find_peaks prominence (legacy 'height')
-GB_DISTANCE = 30           # scipy.find_peaks distance
-GB_INTEGRAL_LOW = 100000   # c2 threshold (peak < 560 nm)
-GB_INTEGRAL_HIGH = 200000  # c3 threshold (peak >= 560 nm)
-GB_LED_BAND = (340.0, 400.0)  # excluded from peak search; integrated separately
 
 # Precursor names (for metadata only)
 PRECURSOR_LIST = ["CsPbOA", "TOABr", "ZnI2"]
@@ -99,260 +99,71 @@ DILUTE_PUMP_NAME = "dds1_p2"
 
 
 # ---------------------------------------------------------------------------
-# Acquisition plan
+# Good/bad fluorescence reacquisition
 # ---------------------------------------------------------------------------
+# When enabled, after each batch of NUM_FLU PL shots the most recent qepro
+# spectrum is classified by `_classify_pl`. Additional batches are taken (in
+# the same Bluesky run, into the same 'fluorescence' stream) until either
+# GOOD_TARGET good batches or MAX_BAD bad batches are accumulated. One small
+# bookkeeping event per batch is emitted into a single auxiliary stream
+# 'fluorescence_quality' for traceability.
 
+USE_GOOD_BAD = False
+GOOD_TARGET = 3            # success once this many good batches collected
+MAX_BAD = 3                # give up after this many bad batches (log + proceed)
 
-def halide_acquire(suggestions, actuators, sensors=None, md=None):
-    """Acquire UV-Vis data for halide perovskite optimization.
-
-    This is the acquisition plan submitted by QueueserverAgent. It:
-    1. Extracts pump rates from the suggestion
-    2. Sets and starts pumps
-    3. Waits for equilibrium (computed from rates, no hardware read)
-    4. Optionally starts toluene dilution
-    5. Collects absorbance + fluorescence spectra in a single run
-    6. Returns the run UID
-
-    Parameters
-    ----------
-    suggestions : list[dict]
-        List of suggestions from the optimizer. Each dict contains DOF names
-        as keys with their suggested values. Typically len == 1.
-    actuators : list[str]
-        Pump device names (may be empty if DOFs have no actuator field).
-    sensors : list[str] | None
-        Sensor device names (e.g., ["QEPro"]).
-    md : dict | None
-        Metadata dict (contains blop_correlation_uid for tracking).
-
-    Yields
-    ------
-    Msg
-        Bluesky messages.
-
-    Returns
-    -------
-    str
-        The UID of the Bluesky run.
-    """
-    suggestion = suggestions[0]
-
-    # Extract rates from suggestion — DOF names like "infusion_rate_CsPb"
-    dof_names = sorted(k for k in suggestion.keys() if k.startswith("infusion_rate"))
-    rate_list = [float(suggestion[name]) for name in dof_names]
-
-    # Resolve pump devices
-    pump_list = _resolve_pumps_from_dofs(dof_names)
-
-    sample_type = _make_sample_name(rate_list)
-
-    # Build metadata
-    _md = {
-        "sample_type": sample_type,
-        "infuse_rates": rate_list,
-        "dof_names": dof_names,
-        "precursors": PRECURSOR_LIST[: len(pump_list)],
-        "pumps": [p.name for p in pump_list],
-        "detectors": ["qepro"],
-    }
-    _md.update(md or {})
-
-    # --- Step 1: Set pump infusion rates ---
-    for pump, rate, syringe, target_vol, set_target, material in zip(
-        pump_list,
-        rate_list,
-        SYRINGE_LIST[: len(pump_list)],
-        TARGET_VOL_LIST[: len(pump_list)],
-        SET_TARGET_LIST[: len(pump_list)],
-        SYRINGE_MATER_LIST[: len(pump_list)],
-    ):
-        if rate == 0.0:
-            continue
-        yield from pump.set_infuse2(
-            syringe,
-            set_target=set_target,
-            target_vol=float(target_vol.split(" ")[0]),
-            target_unit=target_vol.split(" ")[1],
-            infuse_rate=rate,
-            infuse_unit=RATE_UNIT,
-            syringe_material=material,
-        )
-
-    # --- Step 2: Start pumps ---
-    yield from start_group_infuse(pump_list, rate_list)
-
-    # --- Step 3: Wait for equilibrium ---
-    # Compute residence time directly from rate_list (no hardware read needed)
-    wait_sec = _compute_equilibrium_wait(rate_list, RESIDENT_T_RATIO)
-    print(f"\nResidence time: {wait_sec:.1f} s (ratio={RESIDENT_T_RATIO})")
-    yield from _sleep_with_progress(wait_sec)
-
-    # --- Step 4: Optional toluene post-dilution ---
-    dilute_pump = None
-    if POST_DILUTE:
-        dilute_pump = _resolve_pumps([DILUTE_PUMP_NAME])[0]
-        toluene_rate = sum(rate_list) * POST_DILUTE_RATIO
-        yield from dilute_pump.set_infuse2(
-            50,
-            set_target=True,
-            target_vol=30,
-            target_unit="ml",
-            infuse_rate=toluene_rate,
-            infuse_unit=RATE_UNIT,
-            syringe_material="steel",
-        )
-        yield from dilute_pump.infuse_pump2()
-        print(
-            f"\nStarted toluene dilution at {toluene_rate:.1f} uL/min, waiting {POST_DILUTE_WAIT_SEC}s"
-        )
-        yield from bps.sleep(POST_DILUTE_WAIT_SEC)
-
-    # --- Step 5: Collect absorbance + fluorescence in a single run ---
-    uid = yield from _acquire_uvvis(_md)
-
-    # --- Step 6: Stop dilution pump if active ---
-    if dilute_pump is not None:
-        yield from dilute_pump.stop_pump2()
-
-    return uid
+# Classifier thresholds (legacy good_bad_data parity).
+DEFAULT_THRESHOLDS = {
+    "key_height": 2000,        # c1: highest peak intensity > 400 nm
+    "prominence": 30,          # scipy.find_peaks prominence (legacy 'height')
+    "distance": 30,            # scipy.find_peaks distance
+    "integral_low": 100000,    # c2 (peak < 560 nm)
+    "integral_high": 200000,   # c3 (peak >= 560 nm)
+    "led_band": (340.0, 400.0),  # excluded from peak search; integrated separately
+    "split_wavelength": 560.0,
+    "peak_search_min_nm": 400.0,
+}
 
 
 # ---------------------------------------------------------------------------
-# UV-Vis collection
+# Module-level cached Signals for the 'fluorescence_quality' stream.
+# Created once at import time so we don't churn descriptor UIDs across runs.
 # ---------------------------------------------------------------------------
 
-
-def _acquire_uvvis(md):
-    """Collect absorbance and fluorescence spectra in a single Bluesky run.
-
-    Produces two streams: 'absorbance' and 'fluorescence'.
-    Mirrors startup/32-bundle-plan.py xray_uvvis_plan2 (without X-ray).
-    """
-
-    @bpp.stage_decorator([qepro])
-    @bpp.run_decorator(md=md)
-    def _inner():
-        # --- Absorbance ---
-        yield from bps.mv(
-            qepro.correction,
-            "Reference",
-            qepro.spectrum_type,
-            "Absorbtion",
-        )
-        yield from bps.mv(LED, "Low", UV_shutter, "High")
-        yield from bps.sleep(2)
-
-        for _ in range(NUM_ABS):
-            yield from bps.trigger(qepro, wait=True)
-            yield from bps.create(name="absorbance")
-            yield from bps.read(qepro)
-            yield from bps.save()
-
-        # --- Fluorescence (with optional good/bad reacquisition) ---
-        yield from bps.mv(
-            qepro.correction,
-            "Dark",
-            qepro.spectrum_type,
-            "Corrected Sample",
-        )
-        yield from bps.mv(LED, "High", UV_shutter, "Low")
-        yield from bps.sleep(2)
-
-        # Auxiliary Signals for the per-batch bookkeeping stream.
-        # Created lazily so they only exist when the plan runs.
-        q_batch_index = Signal(name="batch_index", value=0)
-        q_verdict = Signal(name="verdict", value="bad")
-        q_peak_wl = Signal(name="peak_wavelength_nm", value=float("nan"))
-        q_n_good = Signal(name="n_good_total", value=0)
-        q_n_bad = Signal(name="n_bad_total", value=0)
-        q_sigs = [q_batch_index, q_verdict, q_peak_wl, q_n_good, q_n_bad]
-
-        good_count = 0
-        bad_count = 0
-        batch_index = 0
-        # Bound the loop so a misconfigured classifier can't run forever.
-        max_batches = (GOOD_TARGET + MAX_BAD) if USE_GOOD_BAD else 1
-
-        while batch_index < max_batches:
-            # One batch of NUM_FLU shots into the 'fluorescence' stream.
-            # All retry batches share the same stream name (identical
-            # descriptor), so no stream proliferation occurs.
-            for _ in range(NUM_FLU):
-                yield from bps.trigger(qepro, wait=True)
-                yield from bps.create(name="fluorescence")
-                yield from bps.read(qepro)
-                yield from bps.save()
-
-            if not USE_GOOD_BAD:
-                break
-
-            # Snapshot the just-acquired spectrum from the device cache and
-            # classify it (legacy behavior: classifier sees one spectrum per
-            # batch, not an average across the NUM_FLU shots).
-            x = np.asarray(qepro.x_axis.get())
-            y = np.asarray(qepro.output.get())
-            is_good, peak_wl = _classify_pl(x, y)
-            if is_good:
-                good_count += 1
-            else:
-                bad_count += 1
-
-            # Emit one bookkeeping event in 'fluorescence_quality'.
-            yield from bps.mv(
-                q_batch_index, batch_index,
-                q_verdict, "good" if is_good else "bad",
-                q_peak_wl, float(peak_wl),
-                q_n_good, good_count,
-                q_n_bad, bad_count,
-            )
-            yield from bps.create(name="fluorescence_quality")
-            for s in q_sigs:
-                yield from bps.read(s)
-            yield from bps.save()
-
-            batch_index += 1
-            if good_count >= GOOD_TARGET:
-                print(
-                    f"*** Got {good_count} good fluorescence batches, proceeding ***"
-                )
-                break
-            if bad_count >= MAX_BAD:
-                print(
-                    f"*** {bad_count} bad fluorescence batches, giving up "
-                    "(proceeding anyway) ***"
-                )
-                break
-
-        # --- Lights off ---
-        yield from bps.mv(LED, "Low", UV_shutter, "Low")
-
-    return (yield from _inner())
+_Q_BATCH_INDEX = Signal(name="batch_index", value=0)
+_Q_VERDICT = Signal(name="verdict", value="bad")
+_Q_PEAK_WL = Signal(name="peak_wavelength_nm", value=float("nan"))
+_Q_N_GOOD = Signal(name="n_good_total", value=0)
+_Q_N_BAD = Signal(name="n_bad_total", value=0)
+_Q_N_EVENTS = Signal(name="n_events_in_batch", value=0)
+_Q_SIGS = [_Q_BATCH_INDEX, _Q_VERDICT, _Q_PEAK_WL, _Q_N_GOOD, _Q_N_BAD, _Q_N_EVENTS]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Classifier
 # ---------------------------------------------------------------------------
 
 
-def _classify_pl(x, y):
+def _classify_pl(x, y, thresholds=None):
     """Classify a PL spectrum as good/bad.
 
     Minimal in-plan port of ``scripts/utils/_data_analysis.good_bad_data`` so
     this module has no dependency on the legacy Kafka/ZMQ pipeline. The
     classifier rejects (returns ``(False, ...)``) when any of:
 
-    - **c1** highest peak (wavelength > 400 nm, excluding the LED band)
-      has intensity below ``GB_KEY_HEIGHT``.
-    - **c2** highest peak is < 560 nm and
-      ``(PL_integral - LED_integral) < GB_INTEGRAL_LOW``.
-    - **c3** highest peak is >= 560 nm and
-      ``(PL_integral - LED_integral) < GB_INTEGRAL_HIGH``.
+    - **c1** highest peak (wavelength > ``peak_search_min_nm``, excluding the
+      LED band) has intensity below ``key_height``.
+    - **c2** highest peak is below ``split_wavelength`` and
+      ``(PL_integral - LED_integral) < integral_low``.
+    - **c3** highest peak is at/above ``split_wavelength`` and
+      ``(PL_integral - LED_integral) < integral_high``.
 
     Parameters
     ----------
     x, y : array_like
         Wavelength (nm) and intensity arrays from the QEPro.
+    thresholds : dict | None
+        Threshold dict; falls back to ``DEFAULT_THRESHOLDS``.
 
     Returns
     -------
@@ -361,17 +172,17 @@ def _classify_pl(x, y):
     """
     from scipy.signal import find_peaks
 
+    t = thresholds or DEFAULT_THRESHOLDS
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    # Restrict peak search to >400 nm and exclude the LED band.
-    led_lo, led_hi = GB_LED_BAND
-    search_mask = (x > 400.0) & ~((x >= led_lo) & (x <= led_hi))
+    led_lo, led_hi = t["led_band"]
+    search_mask = (x > t["peak_search_min_nm"]) & ~((x >= led_lo) & (x <= led_hi))
     xs, ys = x[search_mask], y[search_mask]
     if xs.size == 0:
         return False, float("nan")
 
-    peaks, _ = find_peaks(ys, prominence=GB_PROMINENCE, distance=GB_DISTANCE)
+    peaks, _ = find_peaks(ys, prominence=t["prominence"], distance=t["distance"])
     if peaks.size == 0:
         return False, float("nan")
 
@@ -380,7 +191,7 @@ def _classify_pl(x, y):
     top_int = float(ys[top])
 
     # c1
-    if top_int < GB_KEY_HEIGHT:
+    if top_int < t["key_height"]:
         return False, top_wl
 
     # Integrals over the full spectrum and the LED band.
@@ -390,12 +201,376 @@ def _classify_pl(x, y):
     delta = pl_int - led_int
 
     # c2 / c3
-    if top_wl < 560.0 and delta < GB_INTEGRAL_LOW:
+    if top_wl < t["split_wavelength"] and delta < t["integral_low"]:
         return False, top_wl
-    if top_wl >= 560.0 and delta < GB_INTEGRAL_HIGH:
+    if top_wl >= t["split_wavelength"] and delta < t["integral_high"]:
         return False, top_wl
 
     return True, top_wl
+
+
+# ---------------------------------------------------------------------------
+# Quality monitor (local, blocking callback)
+# ---------------------------------------------------------------------------
+
+
+class PLQualityMonitor(CallbackBase):
+    """Subscribe via ``bpp.subs_decorator`` so it runs synchronously on the
+    RunEngine thread between event docs.
+
+    The plan reads ``.good_count`` / ``.bad_count`` after each batch and calls
+    :meth:`finalize_batch` to classify the most recent spectrum and update the
+    counters.
+
+    Parameters
+    ----------
+    qepro : ophyd device
+        The QEPro device whose ``x_axis`` / ``output`` keys carry the spectrum
+        in the event document. Used to derive event-data field names so this
+        module does not hardcode string keys.
+    stream_name : str
+        Name of the event stream to monitor (default: ``"fluorescence"``).
+    thresholds : dict | None
+        Classifier thresholds; defaults to ``DEFAULT_THRESHOLDS``.
+    """
+
+    def __init__(self, qepro, stream_name="fluorescence", thresholds=None):
+        super().__init__()
+        self.stream_name = stream_name
+        self.x_field = qepro.x_axis.name
+        self.y_field = qepro.output.name
+        self.thresholds = thresholds or DEFAULT_THRESHOLDS
+
+        self._target_descriptors = set()
+        self._latest_spectrum = None        # (x, y) of last event in stream
+        self._batch_event_count = 0
+
+        self.good_count = 0
+        self.bad_count = 0
+        self.batch_index = 0
+        self.batch_results = []             # list[dict], in chronological order
+
+    def descriptor(self, doc):
+        if doc.get("name") == self.stream_name:
+            self._target_descriptors.add(doc["uid"])
+
+    def event(self, doc):
+        if doc["descriptor"] not in self._target_descriptors:
+            return
+        data = doc["data"]
+        if self.x_field not in data or self.y_field not in data:
+            return
+        self._latest_spectrum = (
+            np.asarray(data[self.x_field]),
+            np.asarray(data[self.y_field]),
+        )
+        self._batch_event_count += 1
+
+    def finalize_batch(self):
+        """Classify the most recent spectrum in the just-finished batch.
+
+        Returns the per-batch result dict (also appended to
+        :attr:`batch_results`). Returns ``None`` if no event was observed in
+        the batch (which would indicate a misconfiguration).
+        """
+        if self._latest_spectrum is None:
+            return None
+        x, y = self._latest_spectrum
+        is_good, peak_wl = _classify_pl(x, y, self.thresholds)
+        if is_good:
+            self.good_count += 1
+        else:
+            self.bad_count += 1
+        result = {
+            "batch_index": self.batch_index,
+            "verdict": "good" if is_good else "bad",
+            "peak_wavelength_nm": float(peak_wl),
+            "n_good_total": self.good_count,
+            "n_bad_total": self.bad_count,
+            "n_events_in_batch": self._batch_event_count,
+        }
+        self.batch_results.append(result)
+        self.batch_index += 1
+        self._batch_event_count = 0
+        self._latest_spectrum = None
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Measurement sub-plans
+# ---------------------------------------------------------------------------
+
+
+def measure_absorbance(qepro, n_shots, *, stream="absorbance", settle_sec=2):
+    """Configure optics for absorbance and trigger ``n_shots`` reads.
+
+    Each shot becomes one event in the named stream.
+    """
+    yield from bps.mv(
+        qepro.correction, "Reference",
+        qepro.spectrum_type, "Absorbtion",
+    )
+    yield from bps.mv(LED, "Low", UV_shutter, "High")
+    yield from bps.sleep(settle_sec)
+    for _ in range(n_shots):
+        yield from bps.trigger_and_read([qepro], name=stream)
+
+
+def measure_pl(qepro, n_shots, *, stream="fluorescence", settle_sec=2):
+    """Configure optics for PL and trigger ``n_shots`` reads.
+
+    Each shot becomes one event in the named stream.
+    """
+    yield from bps.mv(
+        qepro.correction, "Dark",
+        qepro.spectrum_type, "Corrected Sample",
+    )
+    yield from bps.mv(LED, "High", UV_shutter, "Low")
+    yield from bps.sleep(settle_sec)
+    for _ in range(n_shots):
+        yield from bps.trigger_and_read([qepro], name=stream)
+
+
+def _emit_quality_event(result):
+    """Emit one event in the ``fluorescence_quality`` stream from a result dict."""
+    if result is None:
+        return
+    yield from bps.mv(
+        _Q_BATCH_INDEX, int(result["batch_index"]),
+        _Q_VERDICT, result["verdict"],
+        _Q_PEAK_WL, float(result["peak_wavelength_nm"]),
+        _Q_N_GOOD, int(result["n_good_total"]),
+        _Q_N_BAD, int(result["n_bad_total"]),
+        _Q_N_EVENTS, int(result["n_events_in_batch"]),
+    )
+    yield from bps.create(name="fluorescence_quality")
+    for s in _Q_SIGS:
+        yield from bps.read(s)
+    yield from bps.save()
+
+
+def _pl_with_quality_gate(qepro, monitor):
+    """Run PL batches until good/bad termination.
+
+    Always runs at least one batch. When ``monitor`` is ``None`` (i.e.,
+    quality gating disabled), returns after that single batch. Otherwise
+    keeps running batches until ``good_count >= GOOD_TARGET`` or
+    ``bad_count >= MAX_BAD``.
+    """
+    # First batch always runs.
+    yield from measure_pl(qepro, NUM_FLU)
+
+    if monitor is None:
+        return
+
+    yield from _emit_quality_event(monitor.finalize_batch())
+
+    while (monitor.good_count < GOOD_TARGET
+           and monitor.bad_count < MAX_BAD):
+        yield from measure_pl(qepro, NUM_FLU)
+        yield from _emit_quality_event(monitor.finalize_batch())
+
+    if monitor.good_count >= GOOD_TARGET:
+        print(f"*** {monitor.good_count} good PL batches, proceeding ***")
+    else:
+        print(
+            f"*** {monitor.bad_count} bad PL batches, "
+            "proceeding anyway ***"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Steady-state flow context (setup + guaranteed teardown)
+# ---------------------------------------------------------------------------
+
+
+def steady_state_flow(
+    plan,
+    pump_list,
+    rate_list,
+    *,
+    syringe_list,
+    target_vol_list,
+    set_target_list,
+    syringe_mater_list,
+    rate_unit=RATE_UNIT,
+    resident_t_ratio=RESIDENT_T_RATIO,
+    post_dilute=False,
+    dilute_pump=None,
+    dilute_rate_ratio=POST_DILUTE_RATIO,
+    dilute_wait_sec=POST_DILUTE_WAIT_SEC,
+):
+    """Wrap ``plan`` with pump setup before and pump stop after.
+
+    On entry: set rates, start the synthesis pumps, wait for the residence
+    time computed from the rates, optionally start toluene dilution.
+
+    On exit (success **or** exception): stop every pump that was started.
+
+    This is the idiomatic ``bpp.finalize_wrapper`` pattern; the closure
+    ``started_pumps`` records what needs stopping so teardown is correct
+    regardless of where setup failed.
+    """
+    started_pumps = []
+
+    def setup():
+        # 1. Set per-pump infusion parameters.
+        for pump, rate, syringe, target_vol, set_target, material in zip(
+            pump_list, rate_list, syringe_list, target_vol_list,
+            set_target_list, syringe_mater_list,
+        ):
+            if rate == 0.0:
+                continue
+            yield from pump.set_infuse2(
+                syringe,
+                set_target=set_target,
+                target_vol=float(target_vol.split(" ")[0]),
+                target_unit=target_vol.split(" ")[1],
+                infuse_rate=rate,
+                infuse_unit=rate_unit,
+                syringe_material=material,
+            )
+
+        # 2. Start synthesis pumps; record which ones we started.
+        yield from start_group_infuse(pump_list, rate_list)
+        started_pumps.extend(
+            p for p, r in zip(pump_list, rate_list) if r > 0
+        )
+
+        # 3. Wait for flow equilibrium (residence time from geometry).
+        wait_sec = _compute_equilibrium_wait(rate_list, resident_t_ratio)
+        print(f"\nResidence time: {wait_sec:.1f} s (ratio={resident_t_ratio})")
+        yield from _sleep_with_progress(wait_sec)
+
+        # 4. Optional toluene dilution.
+        if post_dilute and dilute_pump is not None:
+            toluene_rate = sum(r for r in rate_list if r > 0) * dilute_rate_ratio
+            yield from dilute_pump.set_infuse2(
+                50,
+                set_target=True,
+                target_vol=30,
+                target_unit="ml",
+                infuse_rate=toluene_rate,
+                infuse_unit=rate_unit,
+                syringe_material="steel",
+            )
+            yield from dilute_pump.infuse_pump2()
+            started_pumps.append(dilute_pump)
+            print(
+                f"\nStarted toluene dilution at {toluene_rate:.1f} uL/min, "
+                f"waiting {dilute_wait_sec}s"
+            )
+            yield from bps.sleep(dilute_wait_sec)
+
+    def teardown():
+        for p in started_pumps:
+            try:
+                yield from p.stop_pump2()
+            except Exception as e:  # noqa: BLE001 -- best-effort cleanup
+                print(f"Warning: failed to stop pump {p.name}: {e}")
+
+    def body():
+        yield from setup()
+        return (yield from plan)
+
+    return (yield from bpp.finalize_wrapper(body(), teardown()))
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def halide_acquire(suggestions, actuators, sensors=None, md=None):
+    """Acquire UV-Vis data for halide perovskite optimization.
+
+    The Blop ``AcquisitionPlan`` for one optimizer suggestion:
+
+    1. Set pump rates + start pumps (inside :func:`steady_state_flow`).
+    2. Wait for flow equilibrium.
+    3. Optionally start toluene dilution.
+    4. In a single Bluesky run, collect absorbance and fluorescence streams.
+       With ``USE_GOOD_BAD`` enabled, PL is gated by :class:`PLQualityMonitor`
+       and additional batches are taken until good/bad termination.
+    5. Stop all started pumps (guaranteed by ``bpp.finalize_wrapper``).
+    6. Return the run UID.
+
+    Parameters
+    ----------
+    suggestions : list[dict]
+        Blop suggestions. Each dict maps DOF names to suggested values.
+        Typically ``len(suggestions) == 1``.
+    actuators : list[str]
+        Pump device names (may be empty if DOFs have no actuator field).
+    sensors : list[str] | None
+        Sensor device names (e.g., ``["QEPro"]``).
+    md : dict | None
+        Extra metadata (e.g. ``blop_correlation_uid``).
+
+    Returns
+    -------
+    str
+        UID of the Bluesky run.
+    """
+    # -- Parse suggestion --
+    suggestion = suggestions[0]
+    dof_names = sorted(k for k in suggestion.keys() if k.startswith("infusion_rate"))
+    rate_list = [float(suggestion[name]) for name in dof_names]
+    pump_list = _resolve_pumps_from_dofs(dof_names)
+    sample_type = _make_sample_name(rate_list)
+
+    _md = {
+        "sample_type": sample_type,
+        "infuse_rates": rate_list,
+        "dof_names": dof_names,
+        "precursors": PRECURSOR_LIST[: len(pump_list)],
+        "pumps": [p.name for p in pump_list],
+        "detectors": ["qepro"],
+        "use_good_bad": USE_GOOD_BAD,
+    }
+    _md.update(md or {})
+
+    # -- Quality monitor (only when gating is enabled) --
+    monitor = (
+        PLQualityMonitor(qepro, stream_name="fluorescence")
+        if USE_GOOD_BAD else None
+    )
+    # bpp.subs_decorator dispatches docs synchronously on the RE thread, so
+    # `monitor.finalize_batch()` immediately after `bps.save()` sees the
+    # just-emitted event with no synchronization required.
+    subs = {"descriptor": [monitor], "event": [monitor]} if monitor else {}
+
+    # -- Acquisition body (single Bluesky run) --
+    @bpp.subs_decorator(subs)
+    @bpp.stage_decorator([qepro])
+    @bpp.run_decorator(md=_md)
+    def acquisition():
+        yield from measure_absorbance(qepro, NUM_ABS)
+        yield from _pl_with_quality_gate(qepro, monitor)
+        # Lights off at end of run.
+        yield from bps.mv(LED, "Low", UV_shutter, "Low")
+
+    # -- Resolve dilution pump if requested --
+    dilute_pump = _resolve_pumps([DILUTE_PUMP_NAME])[0] if POST_DILUTE else None
+
+    # -- Run the body inside the flow context (pumps guaranteed to stop) --
+    uid = yield from steady_state_flow(
+        acquisition(),
+        pump_list=pump_list,
+        rate_list=rate_list,
+        syringe_list=SYRINGE_LIST[: len(pump_list)],
+        target_vol_list=TARGET_VOL_LIST[: len(pump_list)],
+        set_target_list=SET_TARGET_LIST[: len(pump_list)],
+        syringe_mater_list=SYRINGE_MATER_LIST[: len(pump_list)],
+        post_dilute=POST_DILUTE,
+        dilute_pump=dilute_pump,
+    )
+    return uid
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
 
 def _compute_equilibrium_wait(rate_list, ratio=1.0):
@@ -419,7 +594,7 @@ def _compute_equilibrium_wait(rate_list, ratio=1.0):
     if total_rate_ul_min <= 0:
         return 0.0
 
-    # Total mixer volume in uL (pi * r^2 * length, converted from mm/cm to uL)
+    # Total mixer volume in uL (pi * r^2 * length, with mm units -> mm^3 == uL).
     total_vol_ul = 0.0
     for length_cm in MIXER_LENGTHS_CM:
         length_mm = length_cm * 10.0
@@ -432,7 +607,7 @@ def _compute_equilibrium_wait(rate_list, ratio=1.0):
 
 
 def _sleep_with_progress(total_sec, steps=100):
-    """Sleep for total_sec, yielding periodically (mirrors sleep_sec_q)."""
+    """Sleep for ``total_sec``, yielding periodically (mirrors ``sleep_sec_q``)."""
     if total_sec <= 0:
         return
     step_sec = total_sec / steps
@@ -447,7 +622,7 @@ def _make_sample_name(rate_list):
 
 
 def _resolve_pumps(pump_names):
-    """Resolve pump device objects from their string names in the startup namespace."""
+    """Resolve pump device objects from string names in the startup namespace."""
     pumps = []
     for name in pump_names:
         device = globals().get(name)
@@ -458,7 +633,7 @@ def _resolve_pumps(pump_names):
 
 
 def _resolve_pumps_from_dofs(dof_names):
-    """Map DOF names to pump devices via DOF_TO_PUMP mapping."""
+    """Map DOF names to pump devices via :data:`DOF_TO_PUMP`."""
     pump_names = []
     for dof in dof_names:
         pname = DOF_TO_PUMP.get(dof)
