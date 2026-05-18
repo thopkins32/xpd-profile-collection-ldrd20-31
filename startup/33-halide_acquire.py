@@ -109,16 +109,16 @@ DILUTE_PUMP_NAME = "dds1_p2"
 # 'fluorescence_quality' for traceability.
 
 USE_GOOD_BAD = False
-GOOD_TARGET = 3            # success once this many good batches collected
-MAX_BAD = 3                # give up after this many bad batches (log + proceed)
+GOOD_TARGET = 3  # success once this many good batches collected
+MAX_BAD = 3  # give up after this many bad batches (log + proceed)
 
 # Classifier thresholds (legacy good_bad_data parity).
 DEFAULT_THRESHOLDS = {
-    "key_height": 2000,        # c1: highest peak intensity > 400 nm
-    "prominence": 30,          # scipy.find_peaks prominence (legacy 'height')
-    "distance": 30,            # scipy.find_peaks distance
-    "integral_low": 100000,    # c2 (peak < 560 nm)
-    "integral_high": 200000,   # c3 (peak >= 560 nm)
+    "key_height": 2000,  # c1: highest peak intensity > 400 nm
+    "prominence": 30,  # scipy.find_peaks prominence (legacy 'height')
+    "distance": 30,  # scipy.find_peaks distance
+    "integral_low": 100000,  # c2 (peak < 560 nm)
+    "integral_high": 200000,  # c3 (peak >= 560 nm)
     "led_band": (340.0, 400.0),  # excluded from peak search; integrated separately
     "split_wavelength": 560.0,
     "peak_search_min_nm": 400.0,
@@ -242,13 +242,13 @@ class PLQualityMonitor(CallbackBase):
         self.thresholds = thresholds or DEFAULT_THRESHOLDS
 
         self._target_descriptors = set()
-        self._latest_spectrum = None        # (x, y) of last event in stream
+        self._latest_spectrum = None  # (x, y) of last event in stream
         self._batch_event_count = 0
 
         self.good_count = 0
         self.bad_count = 0
         self.batch_index = 0
-        self.batch_results = []             # list[dict], in chronological order
+        self.batch_results = []  # list[dict], in chronological order
 
     def descriptor(self, doc):
         if doc.get("name") == self.stream_name:
@@ -307,8 +307,10 @@ def measure_absorbance(qepro, n_shots, *, stream="absorbance", settle_sec=2):
     Each shot becomes one event in the named stream.
     """
     yield from bps.mv(
-        qepro.correction, "Reference",
-        qepro.spectrum_type, "Absorbtion",
+        qepro.correction,
+        "Reference",
+        qepro.spectrum_type,
+        "Absorbtion",
     )
     yield from bps.mv(LED, "Low", UV_shutter, "High")
     yield from bps.sleep(settle_sec)
@@ -322,8 +324,10 @@ def measure_pl(qepro, n_shots, *, stream="fluorescence", settle_sec=2):
     Each shot becomes one event in the named stream.
     """
     yield from bps.mv(
-        qepro.correction, "Dark",
-        qepro.spectrum_type, "Corrected Sample",
+        qepro.correction,
+        "Dark",
+        qepro.spectrum_type,
+        "Corrected Sample",
     )
     yield from bps.mv(LED, "High", UV_shutter, "Low")
     yield from bps.sleep(settle_sec)
@@ -336,12 +340,18 @@ def _emit_quality_event(result):
     if result is None:
         return
     yield from bps.mv(
-        _Q_BATCH_INDEX, int(result["batch_index"]),
-        _Q_VERDICT, result["verdict"],
-        _Q_PEAK_WL, float(result["peak_wavelength_nm"]),
-        _Q_N_GOOD, int(result["n_good_total"]),
-        _Q_N_BAD, int(result["n_bad_total"]),
-        _Q_N_EVENTS, int(result["n_events_in_batch"]),
+        _Q_BATCH_INDEX,
+        int(result["batch_index"]),
+        _Q_VERDICT,
+        result["verdict"],
+        _Q_PEAK_WL,
+        float(result["peak_wavelength_nm"]),
+        _Q_N_GOOD,
+        int(result["n_good_total"]),
+        _Q_N_BAD,
+        int(result["n_bad_total"]),
+        _Q_N_EVENTS,
+        int(result["n_events_in_batch"]),
     )
     yield from bps.create(name="fluorescence_quality")
     for s in _Q_SIGS:
@@ -365,18 +375,14 @@ def _pl_with_quality_gate(qepro, monitor):
 
     yield from _emit_quality_event(monitor.finalize_batch())
 
-    while (monitor.good_count < GOOD_TARGET
-           and monitor.bad_count < MAX_BAD):
+    while monitor.good_count < GOOD_TARGET and monitor.bad_count < MAX_BAD:
         yield from measure_pl(qepro, NUM_FLU)
         yield from _emit_quality_event(monitor.finalize_batch())
 
     if monitor.good_count >= GOOD_TARGET:
         print(f"*** {monitor.good_count} good PL batches, proceeding ***")
     else:
-        print(
-            f"*** {monitor.bad_count} bad PL batches, "
-            "proceeding anyway ***"
-        )
+        print(f"*** {monitor.bad_count} bad PL batches, proceeding anyway ***")
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +422,12 @@ def steady_state_flow(
     def setup():
         # 1. Set per-pump infusion parameters.
         for pump, rate, syringe, target_vol, set_target, material in zip(
-            pump_list, rate_list, syringe_list, target_vol_list,
-            set_target_list, syringe_mater_list,
+            pump_list,
+            rate_list,
+            syringe_list,
+            target_vol_list,
+            set_target_list,
+            syringe_mater_list,
         ):
             if rate == 0.0:
                 continue
@@ -433,9 +443,7 @@ def steady_state_flow(
 
         # 2. Start synthesis pumps; record which ones we started.
         yield from start_group_infuse(pump_list, rate_list)
-        started_pumps.extend(
-            p for p, r in zip(pump_list, rate_list) if r > 0
-        )
+        started_pumps.extend(p for p, r in zip(pump_list, rate_list) if r > 0)
 
         # 3. Wait for flow equilibrium (residence time from geometry).
         wait_sec = _compute_equilibrium_wait(rate_list, resident_t_ratio)
@@ -532,8 +540,7 @@ def halide_acquire(suggestions, actuators, sensors=None, md=None):
 
     # -- Quality monitor (only when gating is enabled) --
     monitor = (
-        PLQualityMonitor(qepro, stream_name="fluorescence")
-        if USE_GOOD_BAD else None
+        PLQualityMonitor(qepro, stream_name="fluorescence") if USE_GOOD_BAD else None
     )
     # bpp.subs_decorator dispatches docs synchronously on the RE thread, so
     # `monitor.finalize_batch()` immediately after `bps.save()` sees the
